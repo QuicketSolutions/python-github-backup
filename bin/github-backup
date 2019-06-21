@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -303,6 +304,19 @@ def parse_args():
     parser.add_argument('--keychain-account',
                         dest='osx_keychain_item_account',
                         help='OSX ONLY: account field of password item in OSX keychain that holds the personal access or OAuth token')
+    parser.add_argument('--include-releases',
+                        action='store_true',
+                        dest='include_releases',
+                        help='include release information'
+                        )
+    parser.add_argument('--include-assets',
+                        action='store_true',
+                        dest='include_assets',
+                        help='include assets alongside release information; only applies if including releases')
+    parser.add_argument('--include-binaries',
+                        action='store_true',
+                        dest='include_binaries',
+                        help='include binaries alongside release information; only applies if including releases')
     return parser.parse_args()
 
 
@@ -438,13 +452,47 @@ def retrieve_data(args, template, query_args=None, single_request=False):
     return data
 
 
+def retrieve_binary_data(args, template, query_args=None):
+    auth = get_auth(args)
+    query_args = get_query_args(query_args)
+    data = bytes()
+
+    request = _construct_binary_request(query_args, template, auth)
+    r, errors = _get_response(request, auth, template, follow_redirect=True)
+
+    status_code = int(r.getcode())
+
+    retries = 0
+    while retries < 3 and status_code == 502:
+        print('API request returned HTTP 502: Bad Gateway. Retrying in 5 seconds')
+        retries += 1
+        time.sleep(5)
+        request = _construct_binary_request(query_args, template, auth)  # noqa
+        r, errors = _get_response(request, auth, template, follow_redirect=True)
+
+        status_code = int(r.getcode())
+
+    if status_code != 200:
+        template = 'API request returned HTTP {0}: {1}'
+        errors.append(template.format(status_code, r.reason))
+        log_error(errors)
+
+    response = r.read()
+    if len(errors) == 0:
+        data = response
+    else:
+        log_error(errors)
+
+    return data
+
+
 def get_query_args(query_args=None):
     if not query_args:
         query_args = {}
     return query_args
 
 
-def _get_response(request, auth, template):
+def _get_response(request, auth, template, follow_redirect=False):
     retry_timeout = 3
     errors = []
     # We'll make requests in a loop so we can
@@ -454,6 +502,17 @@ def _get_response(request, auth, template):
         try:
             r = urlopen(request)
         except HTTPError as exc:
+            # if follow_redirect and exc.code == 400:
+            #     try:
+            #         redirect_url = request.redirect_dict.keys()[0]
+            #     except TypeError:
+            #         # python3 uses weird keys return type...
+            #         redirect_url = list(request.redirect_dict.keys())[0]
+            #     request.full_url = redirect_url
+            #     request._full_url = redirect_url
+            #     request.headers = {}
+            #     r = urlopen(request)
+            # else:
             errors, should_continue = _request_http_error(exc, auth, errors)  # noqa
             r = exc
         except URLError as e:
@@ -483,6 +542,22 @@ def _construct_request(per_page, page, query_args, template, auth):
     request = Request(template + '?' + querystring)
     if auth is not None:
         request.add_header('Authorization', 'Basic '.encode('ascii') + auth)
+    log_info('Requesting {}?{}'.format(template, querystring))
+    return request
+
+
+def _construct_binary_request(query_args, template, auth):
+    querystring = urlencode(dict(
+        list(query_args.items())
+    ))
+
+    request_url = template + '?' + querystring if querystring else template
+    request = Request(request_url)
+    if auth is not None:
+        request.add_header('Authorization', 'Basic '.encode('ascii') + auth)
+        request.add_header('Accept', 'application/octet-stream'.encode('ascii'))
+        # # adding that `Accept` header causes HTTP 400 to be thrown, but the `request` gains a new attribute
+        # # `redirect_dict` gains a KEY with the redirect url...
     log_info('Requesting {}?{}'.format(template, querystring))
     return request
 
@@ -699,6 +774,9 @@ def backup_repositories(args, output_directory, repositories):
         if args.include_hooks or args.include_everything:
             backup_hooks(args, repo_cwd, repository, repos_template)
 
+        if args.include_releases or args.include_everything:
+            backup_releases(args, repo_cwd, repository, repos_template)
+
     if args.incremental:
         open(last_update_path, 'w').write(last_update)
 
@@ -878,6 +956,91 @@ def backup_hooks(args, repo_cwd, repository, repos_template):
                      hook_cwd)
     except SystemExit:
         log_info("Unable to read hooks, skipping")
+
+
+def backup_releases(args, repo_cwd, repository, repos_template):
+    # # is this appropriate? I only see it happening for `backup_hooks()` and no other backup functions...
+    # auth = get_auth(args)
+    # if not auth:
+    #     log_info("Skipping releases since no authentication provided")
+    #     return
+    repository_fullname = repository['full_name']
+
+    # give release files somewhere to live & log intent
+    release_cwd = os.path.join(repo_cwd, 'releases')
+    log_info('Retrieving {0} releases'.format(repository_fullname))
+    mkdir_p(repo_cwd, release_cwd)
+
+    # and prepare for assets
+    should_include_assets = args.include_assets or args.include_everything
+    assets_cwd = os.path.join(release_cwd, 'assets')
+    if should_include_assets:
+        mkdir_p(release_cwd, assets_cwd)
+    # as well as binaries
+    should_include_binaries = args.include_binaries or args.include_everything
+    binaries_cwd = os.path.join(release_cwd, 'binaries')
+    if should_include_binaries:
+        mkdir_p(release_cwd, binaries_cwd)
+
+    query_args = {}
+
+    _release_template = '{0}/{1}/releases'.format(repos_template, repository_fullname)
+    _releases = retrieve_data(args, _release_template, query_args=query_args)
+
+    # for each release, store it
+    log_info('Saving {0} releases to disk'.format(len(_releases)))
+    for release_number, release in enumerate(_releases):
+        release_name = release['tag_name']
+        release_id = release['id']
+        output_filepath = os.path.join(release_cwd, '{0}.json'.format(release_name))
+        with codecs.open(output_filepath, 'w+', encoding='utf-8') as f:
+            json_dump(release, f)
+
+        if should_include_assets:
+            _assets_template = '{0}/{1}/assets'.format(_release_template, release_id)
+            _assets = retrieve_data(args, _assets_template)
+            # give asset files somewhere to live & log intent
+            assets = release['assets']
+            # the API appears to not list any assets even when the two defaults are shown on the webpage (zip & tarball)
+            log_info('Retrieving {0} related assets and writing them to disk'.format(len(assets)))
+            asset_cwd = os.path.join(assets_cwd, release_name)
+            mkdir_p(asset_cwd)
+
+            for asset in assets:
+                # download asset to destination
+                asset_name = asset['name']
+                asset_filepath = os.path.join(asset_cwd, asset_name)
+                _asset_template = asset['url']
+                asset_data = retrieve_binary_data(args, _asset_template)
+                with open(asset_filepath, 'wb+') as f:
+                    f.write(asset_data)
+                # with urlopen(asset_link) as asset_response, open(asset_filepath, 'wb+') as f:
+                #     shutil.copyfileobj(asset_response, f)
+
+        if should_include_binaries:
+            binary_name_and_extension = (
+                ('tarball_url', 'tar.gz'),
+                ('zipball_url', 'zip')
+            )
+
+            # give binary files somewhere to live & log intent, then download them
+            log_info('Retrieving {0} related binaries and writing them to disk'.format(len(binary_name_and_extension)))
+            binary_cwd = os.path.join(binaries_cwd, release_name)
+            mkdir_p(binary_cwd)
+            for binary_url_name, binary_extension in binary_name_and_extension:
+                _binary_template = release.get(binary_url_name)
+                if _binary_template is None:
+                    log_info()
+                binary_data = retrieve_binary_data(args, _binary_template)
+                binary_path = os.path.join(
+                    binary_cwd,
+                    '{0}.{1}'.format(
+                        binary_url_name.split('_url')[0],
+                        binary_extension)
+                )
+                with open(binary_path, 'wb+') as f:
+                    f.write(binary_data)
+    pass
 
 
 def fetch_repository(name,
